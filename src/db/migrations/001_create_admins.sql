@@ -8,3 +8,4 @@ CREATE TABLE IF NOT EXISTS admins (
 );
 
 CREATE INDEX IF NOT EXISTS admins_email_idx ON admins (email);
+-- Admin authentication Workflow

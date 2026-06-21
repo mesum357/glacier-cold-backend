@@ -43,8 +43,13 @@ SELECT setval(
   'invoice_no_seq',
   GREATEST(
     COALESCE((SELECT MAX(invoice_no) FROM sales), 0),
+    COALESCE((SELECT MAX(invoice_no) FROM stock_ins), 0),
+    1
+  ),
+  GREATEST(
+    COALESCE((SELECT MAX(invoice_no) FROM sales), 0),
     COALESCE((SELECT MAX(invoice_no) FROM stock_ins), 0)
-  )
+  ) > 0
 );
 
 ALTER TABLE sales

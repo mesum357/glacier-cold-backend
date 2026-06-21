@@ -15,10 +15,14 @@ import { notificationsRouter } from "./routes/notifications.routes.js";
 export function createApp() {
   const app = express();
 
+  app.set("trust proxy", 1);
   app.use(helmet());
   app.use(
     cors({
-      origin: process.env.CORS_ORIGIN ?? "http://localhost:5173",
+      origin: (process.env.CORS_ORIGIN ?? "http://localhost:5173")
+        .split(",")
+        .map((o) => o.trim())
+        .filter(Boolean),
       credentials: true,
     }),
   );

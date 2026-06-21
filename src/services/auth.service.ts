@@ -54,12 +54,17 @@ export function verifyToken(token: string) {
 }
 
 export function cookieOptions() {
+  const secure =
+    process.env.COOKIE_SECURE === "true" ||
+    (process.env.COOKIE_SECURE !== "false" && env.NODE_ENV === "production");
+  const domain = process.env.COOKIE_DOMAIN?.trim();
   return {
     httpOnly: true,
-    secure: env.NODE_ENV === "production",
+    secure,
     sameSite: "lax" as const,
     maxAge: 7 * 24 * 60 * 60 * 1000,
     path: "/",
+    ...(domain ? { domain } : {}),
   };
 }
 

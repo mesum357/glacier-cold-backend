@@ -9,5 +9,6 @@ CREATE TABLE IF NOT EXISTS consumers (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+--  Product table query
 CREATE INDEX IF NOT EXISTS consumers_name_idx ON consumers (name);
 CREATE INDEX IF NOT EXISTS consumers_status_idx ON consumers (status);

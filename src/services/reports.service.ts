@@ -1,4 +1,5 @@
 import { pool } from "../db/pool.js";
+import { countExpiringSoonProducts } from "./products.service.js";
 import { getShopSettings } from "./settings.service.js";
 
 export type SalesChartPoint = { label: string; value: number };
@@ -41,6 +42,7 @@ export type ReportsData = {
   topProducts: TopProduct[];
   lowStock: LowStockProduct[];
   lowStockCount: number;
+  expiringSoonCount: number;
   inventoryHealthPercent: number;
   categoriesNeedingRestock: number;
 };
@@ -180,6 +182,7 @@ export async function getReports(): Promise<ReportsData> {
   const total = Number(healthRows[0].total);
   const inStock = Number(healthRows[0].in_stock);
   const categoriesNeedingRestock = Number(healthRows[0].categories_needing_restock);
+  const expiringSoonCount = await countExpiringSoonProducts();
 
   return {
     timezone: tz,
@@ -218,6 +221,7 @@ export async function getReports(): Promise<ReportsData> {
           : Number(r.threshold_limit),
     })),
     lowStockCount: Number(lowCountRows[0].count),
+    expiringSoonCount,
     inventoryHealthPercent: total === 0 ? 100 : Math.round((inStock / total) * 100),
     categoriesNeedingRestock,
   };

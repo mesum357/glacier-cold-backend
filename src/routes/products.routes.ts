@@ -5,20 +5,37 @@ import {
   createProduct,
   deleteProduct,
   getProductStats,
+  listExpiringSoonProducts,
   listLowStockProducts,
   listProducts,
   updateProduct,
 } from "../services/products.service.js";
 
-const productSchema = z.object({
-  name: z.string().min(1).max(200),
-  category: z.string().min(1).max(100),
-  barcode: z.string().min(1).max(64),
-  buyingPrice: z.number().nonnegative(),
-  sellingPrice: z.number().nonnegative(),
-  quantity: z.number().int().nonnegative(),
-  thresholdLimit: z.number().int().nonnegative(),
-});
+const productSchema = z
+  .object({
+    name: z.string().min(1).max(200),
+    category: z.string().min(1).max(100),
+    barcode: z.string().min(1).max(64),
+    buyingPrice: z.number().nonnegative(),
+    sellingPrice: z.number().nonnegative(),
+    quantity: z.number().int().nonnegative(),
+    thresholdLimit: z.number().int().nonnegative(),
+    productionDate: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/)
+      .nullable()
+      .optional(),
+    expiryDate: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/)
+      .nullable()
+      .optional(),
+    expiryAlertDays: z.number().int().positive().nullable().optional(),
+  })
+  .refine(
+    (data) => !data.productionDate || !data.expiryDate || data.expiryDate >= data.productionDate,
+    { message: "Expiry date must be on or after production date", path: ["expiryDate"] },
+  );
 
 export const productsRouter = Router();
 
@@ -36,6 +53,11 @@ productsRouter.get("/stats", async (_req, res) => {
 
 productsRouter.get("/low-stock", async (_req, res) => {
   const products = await listLowStockProducts();
+  return res.json({ products });
+});
+
+productsRouter.get("/expiring-soon", async (_req, res) => {
+  const products = await listExpiringSoonProducts();
   return res.json({ products });
 });
 
