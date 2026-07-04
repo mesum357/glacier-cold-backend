@@ -1,6 +1,10 @@
 import { pool } from "../db/pool.js";
-import { allocateInvoiceNo } from "./invoice-no.service.js";
+import { roundMoney, saleLineTotal, validateAdvanceAmount } from "../lib/money.js";
+import { type PaymentStatus } from "../lib/payment-status.js";
+import { allocateSalesInvoiceNo } from "./invoice-no.service.js";
 import { aggregateSaleItems, validateSaleQuantity } from "./sales.validation.js";
+
+export type { PaymentStatus };
 
 export type SaleItem = {
   id: string;
@@ -8,7 +12,11 @@ export type SaleItem = {
   productName: string;
   quantity: number;
   unitPrice: number;
+  unitCost: number;
   lineTotal: number;
+  cartonQuantity: number | null;
+  cartonPrice: number | null;
+  paymentStatus: PaymentStatus;
 };
 
 export type Sale = {
@@ -17,6 +25,8 @@ export type Sale = {
   supplierName: string;
   saleAt: string;
   totalAmount: number;
+  advanceAmount: number;
+  paymentStatus: PaymentStatus;
   items: SaleItem[];
   createdAt: string;
 };
@@ -24,11 +34,17 @@ export type Sale = {
 export type SaleItemInput = {
   productId: string;
   quantity: number;
+  unitPrice?: number;
+  cartonQuantity?: number | null;
+  cartonPrice?: number | null;
+  paymentStatus?: PaymentStatus;
 };
 
 export type CreateSaleInput = {
   supplierName: string;
   saleAt?: string;
+  paymentStatus?: PaymentStatus;
+  advanceAmount?: number;
   items: SaleItemInput[];
 };
 
@@ -37,16 +53,31 @@ export type SaleFilters = {
   supplier?: string;
   period?: string;
   year?: number;
+  paymentStatus?: PaymentStatus;
 };
 
 function mapSaleItem(row: Record<string, unknown>): SaleItem {
+  const unitCost =
+    row.unit_cost === null || row.unit_cost === undefined
+      ? 0
+      : Number(row.unit_cost);
   return {
     id: row.id as string,
     productId: (row.product_id as string) ?? null,
     productName: row.product_name as string,
     quantity: Number(row.quantity),
     unitPrice: Number(row.unit_price),
+    unitCost,
     lineTotal: Number(row.line_total),
+    cartonQuantity:
+      row.carton_quantity === null || row.carton_quantity === undefined
+        ? null
+        : Number(row.carton_quantity),
+    cartonPrice:
+      row.carton_price === null || row.carton_price === undefined
+        ? null
+        : Number(row.carton_price),
+    paymentStatus: row.payment_status as PaymentStatus,
   };
 }
 
@@ -57,6 +88,8 @@ function mapSale(row: Record<string, unknown>, items: SaleItem[]): Sale {
     supplierName: row.supplier_name as string,
     saleAt: (row.sale_at as Date).toISOString(),
     totalAmount: Number(row.total_amount),
+    advanceAmount: Number(row.advance_amount ?? 0),
+    paymentStatus: row.payment_status as PaymentStatus,
     items,
     createdAt: (row.created_at as Date).toISOString(),
   };
@@ -128,7 +161,7 @@ async function fetchSalesByIds(ids: string[]): Promise<Sale[]> {
   );
 
   const { rows: itemRows } = await pool.query(
-    `SELECT * FROM sale_items WHERE sale_id = ANY($1::uuid[]) ORDER BY product_name`,
+    `SELECT * FROM sale_items WHERE sale_id = ANY($1::uuid[]) ORDER BY line_order ASC, id ASC`,
     [ids],
   );
 
@@ -143,12 +176,178 @@ async function fetchSalesByIds(ids: string[]): Promise<Sale[]> {
   return saleRows.map((row) => mapSale(row, itemsBySale.get(row.id as string) ?? []));
 }
 
+export async function getSaleById(id: string): Promise<Sale | null> {
+  const sales = await fetchSalesByIds([id]);
+  return sales[0] ?? null;
+}
+
+export async function updateSale(id: string, input: CreateSaleInput): Promise<Sale> {
+  if (input.items.length === 0) {
+    throw new Error("At least one product is required");
+  }
+
+  const aggregatedItems = aggregateSaleItems(
+    input.items.map((item) => ({
+      productId: item.productId,
+      quantity: item.quantity,
+      unitPrice: item.unitPrice,
+      cartonQuantity: item.cartonQuantity ?? null,
+      cartonPrice: item.cartonPrice ?? null,
+    })),
+  );
+
+  const salePaymentStatus = input.paymentStatus ?? "pending";
+  const advanceAmount = roundMoney(input.advanceAmount ?? 0);
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const { rows: saleRows } = await client.query(
+      `SELECT * FROM sales WHERE id = $1 FOR UPDATE`,
+      [id],
+    );
+    const existingSale = saleRows[0];
+    if (!existingSale) throw new Error("Sale not found");
+
+    const { rows: oldItemRows } = await client.query(
+      `SELECT * FROM sale_items WHERE sale_id = $1 FOR UPDATE`,
+      [id],
+    );
+
+    for (const oldItem of oldItemRows) {
+      if (!oldItem.product_id) continue;
+      await client.query(
+        `UPDATE products SET quantity = quantity + $2, updated_at = NOW() WHERE id = $1`,
+        [oldItem.product_id, oldItem.quantity],
+      );
+    }
+
+    await client.query(`DELETE FROM sale_items WHERE sale_id = $1`, [id]);
+
+    const saleAt = input.saleAt ? new Date(input.saleAt) : new Date(existingSale.sale_at);
+    let totalAmount = 0;
+    const preparedItems: {
+      productId: string;
+      productName: string;
+      quantity: number;
+      unitPrice: number;
+      unitCost: number;
+      lineTotal: number;
+      cartonQuantity: number | null;
+      cartonPrice: number | null;
+      lineOrder: number;
+    }[] = [];
+
+    for (let lineOrder = 0; lineOrder < aggregatedItems.length; lineOrder++) {
+      const item = aggregatedItems[lineOrder];
+      const { rows } = await client.query(
+        `SELECT id, name, quantity, selling_price, buying_price FROM products WHERE id = $1 FOR UPDATE`,
+        [item.productId],
+      );
+      const product = rows[0];
+      if (!product) throw new Error("Product not found");
+      if (product.selling_price == null) {
+        throw new Error(`Selling price not set for ${product.name}. Update it on the Products page.`);
+      }
+
+      const available = Number(product.quantity);
+      validateSaleQuantity(product.name as string, available, item.quantity);
+
+      const unitPrice =
+        item.unitPrice != null && item.unitPrice >= 0
+          ? item.unitPrice
+          : Number(product.selling_price);
+      const unitCost = Number(product.buying_price);
+      const lineTotal = saleLineTotal(item.quantity, unitPrice);
+      totalAmount = roundMoney(totalAmount + lineTotal);
+
+      preparedItems.push({
+        productId: product.id as string,
+        productName: product.name as string,
+        quantity: item.quantity,
+        unitPrice,
+        unitCost,
+        lineTotal,
+        cartonQuantity: item.cartonQuantity,
+        cartonPrice: item.cartonPrice,
+        lineOrder,
+      });
+    }
+
+    validateAdvanceAmount(advanceAmount, totalAmount);
+
+    const { rows: updatedSaleRows } = await client.query(
+      `
+      UPDATE sales
+      SET supplier_name = $2, sale_at = $3, total_amount = $4, payment_status = $5, advance_amount = $6
+      WHERE id = $1
+      RETURNING *
+      `,
+      [id, input.supplierName.trim(), saleAt, totalAmount, salePaymentStatus, advanceAmount],
+    );
+    const sale = updatedSaleRows[0];
+
+    const items: SaleItem[] = [];
+    for (const item of preparedItems) {
+      await client.query(
+        `UPDATE products SET quantity = quantity - $2, updated_at = NOW() WHERE id = $1`,
+        [item.productId, item.quantity],
+      );
+
+      const { rows: itemRows } = await client.query(
+        `
+        INSERT INTO sale_items (
+          sale_id, product_id, product_name, quantity, unit_price, unit_cost, line_total,
+          payment_status, carton_quantity, carton_price, line_order
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        RETURNING *
+        `,
+        [
+          sale.id,
+          item.productId,
+          item.productName,
+          item.quantity,
+          item.unitPrice,
+          item.unitCost,
+          item.lineTotal,
+          salePaymentStatus,
+          item.cartonQuantity,
+          item.cartonPrice,
+          item.lineOrder,
+        ],
+      );
+      items.push(mapSaleItem(itemRows[0]));
+    }
+
+    await client.query("COMMIT");
+    return mapSale(sale, items);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 export async function createSale(input: CreateSaleInput): Promise<Sale> {
   if (input.items.length === 0) {
     throw new Error("At least one product is required");
   }
 
-  const aggregatedItems = aggregateSaleItems(input.items);
+  const aggregatedItems = aggregateSaleItems(
+    input.items.map((item) => ({
+      productId: item.productId,
+      quantity: item.quantity,
+      unitPrice: item.unitPrice,
+      cartonQuantity: item.cartonQuantity ?? null,
+      cartonPrice: item.cartonPrice ?? null,
+    })),
+  );
+
+  const salePaymentStatus = input.paymentStatus ?? "pending";
+  const advanceAmount = roundMoney(input.advanceAmount ?? 0);
 
   const client = await pool.connect();
   try {
@@ -161,12 +360,17 @@ export async function createSale(input: CreateSaleInput): Promise<Sale> {
       productName: string;
       quantity: number;
       unitPrice: number;
+      unitCost: number;
       lineTotal: number;
+      cartonQuantity: number | null;
+      cartonPrice: number | null;
+      lineOrder: number;
     }[] = [];
 
-    for (const item of aggregatedItems) {
+    for (let lineOrder = 0; lineOrder < aggregatedItems.length; lineOrder++) {
+      const item = aggregatedItems[lineOrder];
       const { rows } = await client.query(
-        `SELECT id, name, quantity, selling_price FROM products WHERE id = $1 FOR UPDATE`,
+        `SELECT id, name, quantity, selling_price, buying_price FROM products WHERE id = $1 FOR UPDATE`,
         [item.productId],
       );
       const product = rows[0];
@@ -178,28 +382,38 @@ export async function createSale(input: CreateSaleInput): Promise<Sale> {
       const available = Number(product.quantity);
       validateSaleQuantity(product.name as string, available, item.quantity);
 
-      const unitPrice = Number(product.selling_price);
-      const lineTotal = unitPrice * item.quantity;
-      totalAmount += lineTotal;
+      const unitPrice =
+        item.unitPrice != null && item.unitPrice >= 0
+          ? item.unitPrice
+          : Number(product.selling_price);
+      const unitCost = Number(product.buying_price);
+      const lineTotal = saleLineTotal(item.quantity, unitPrice);
+      totalAmount = roundMoney(totalAmount + lineTotal);
 
       preparedItems.push({
         productId: product.id as string,
         productName: product.name as string,
         quantity: item.quantity,
         unitPrice,
+        unitCost,
         lineTotal,
+        cartonQuantity: item.cartonQuantity,
+        cartonPrice: item.cartonPrice,
+        lineOrder,
       });
     }
 
-    const invoiceNo = await allocateInvoiceNo(client);
+    validateAdvanceAmount(advanceAmount, totalAmount);
+
+    const invoiceNo = await allocateSalesInvoiceNo(client);
 
     const { rows: saleRows } = await client.query(
       `
-      INSERT INTO sales (supplier_name, sale_at, total_amount, invoice_no)
-      VALUES ($1, $2, $3, $4)
+      INSERT INTO sales (supplier_name, sale_at, total_amount, invoice_no, payment_status, advance_amount)
+      VALUES ($1, $2, $3, $4, $5, $6)
       RETURNING *
       `,
-      [input.supplierName.trim(), saleAt, totalAmount, invoiceNo],
+      [input.supplierName.trim(), saleAt, totalAmount, invoiceNo, salePaymentStatus, advanceAmount],
     );
     const sale = saleRows[0];
 
@@ -212,11 +426,26 @@ export async function createSale(input: CreateSaleInput): Promise<Sale> {
 
       const { rows: itemRows } = await client.query(
         `
-        INSERT INTO sale_items (sale_id, product_id, product_name, quantity, unit_price, line_total)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO sale_items (
+          sale_id, product_id, product_name, quantity, unit_price, unit_cost, line_total,
+          payment_status, carton_quantity, carton_price, line_order
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         RETURNING *
         `,
-        [sale.id, item.productId, item.productName, item.quantity, item.unitPrice, item.lineTotal],
+        [
+          sale.id,
+          item.productId,
+          item.productName,
+          item.quantity,
+          item.unitPrice,
+          item.unitCost,
+          item.lineTotal,
+          salePaymentStatus,
+          item.cartonQuantity,
+          item.cartonPrice,
+          item.lineOrder,
+        ],
       );
       items.push(mapSaleItem(itemRows[0]));
     }
@@ -268,6 +497,11 @@ export async function listSales(filters: SaleFilters = {}): Promise<Sale[]> {
     }
   }
 
+  if (filters.paymentStatus) {
+    conditions.push(`s.payment_status = $${idx++}`);
+    params.push(filters.paymentStatus);
+  }
+
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
   const { rows } = await pool.query(
@@ -285,9 +519,54 @@ export async function getSalesSummary(filters: SaleFilters = {}) {
     (sum, s) => sum + s.items.reduce((n, i) => n + i.quantity, 0),
     0,
   );
+  const grossProfit = sales.reduce(
+    (sum, s) =>
+      sum +
+      s.items.reduce((lineSum, item) => lineSum + (item.lineTotal - item.unitCost * item.quantity), 0),
+    0,
+  );
   return {
     transactionCount: sales.length,
     totalAmount,
     totalItems,
+    grossProfit,
   };
+}
+
+export async function updateSalePaymentStatus(
+  id: string,
+  paymentStatus: PaymentStatus,
+): Promise<Sale | null> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const { rows } = await client.query(
+      `
+      UPDATE sales
+      SET payment_status = $2
+      WHERE id = $1
+      RETURNING *
+      `,
+      [id, paymentStatus],
+    );
+    if (!rows[0]) {
+      await client.query("ROLLBACK");
+      return null;
+    }
+
+    await client.query(
+      `UPDATE sale_items SET payment_status = $2 WHERE sale_id = $1`,
+      [id, paymentStatus],
+    );
+
+    await client.query("COMMIT");
+    const sales = await fetchSalesByIds([id]);
+    return sales[0] ?? null;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }

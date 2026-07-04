@@ -8,7 +8,9 @@ import {
   listExpiringSoonProducts,
   listLowStockProducts,
   listProducts,
+  reconcileInventory,
   updateProduct,
+  type ProductInput,
 } from "../services/products.service.js";
 
 const productSchema = z
@@ -19,7 +21,7 @@ const productSchema = z
     buyingPrice: z.number().nonnegative(),
     sellingPrice: z.number().nonnegative(),
     quantity: z.number().int().nonnegative(),
-    thresholdLimit: z.number().int().nonnegative(),
+    thresholdLimit: z.number().int().nonnegative().nullable().optional(),
     productionDate: z
       .string()
       .regex(/^\d{4}-\d{2}-\d{2}$/)
@@ -36,6 +38,13 @@ const productSchema = z
     (data) => !data.productionDate || !data.expiryDate || data.expiryDate >= data.productionDate,
     { message: "Expiry date must be on or after production date", path: ["expiryDate"] },
   );
+
+function normalizeProductInput(data: z.infer<typeof productSchema>): ProductInput {
+  return {
+    ...data,
+    thresholdLimit: data.thresholdLimit ?? null,
+  };
+}
 
 export const productsRouter = Router();
 
@@ -61,6 +70,11 @@ productsRouter.get("/expiring-soon", async (_req, res) => {
   return res.json({ products });
 });
 
+productsRouter.post("/reconcile-inventory", async (_req, res) => {
+  const adjustments = await reconcileInventory();
+  return res.json({ adjustments });
+});
+
 productsRouter.post("/", async (req, res) => {
   const parsed = productSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -68,7 +82,7 @@ productsRouter.post("/", async (req, res) => {
   }
 
   try {
-    const product = await createProduct(parsed.data);
+    const product = await createProduct(normalizeProductInput(parsed.data));
     return res.status(201).json({ product });
   } catch (err) {
     if ((err as { code?: string }).code === "23505") {
@@ -85,7 +99,7 @@ productsRouter.put("/:id", async (req, res) => {
   }
 
   try {
-    const product = await updateProduct(req.params.id, parsed.data);
+    const product = await updateProduct(req.params.id, normalizeProductInput(parsed.data));
     if (!product) return res.status(404).json({ error: "Product not found" });
     return res.json({ product });
   } catch (err) {
@@ -97,7 +111,14 @@ productsRouter.put("/:id", async (req, res) => {
 });
 
 productsRouter.delete("/:id", async (req, res) => {
-  const deleted = await deleteProduct(req.params.id);
-  if (!deleted) return res.status(404).json({ error: "Product not found" });
-  return res.json({ ok: true });
+  try {
+    await deleteProduct(req.params.id);
+    return res.json({ ok: true });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Failed to delete product";
+    if (message === "Product not found") {
+      return res.status(404).json({ error: message });
+    }
+    return res.status(400).json({ error: message });
+  }
 });

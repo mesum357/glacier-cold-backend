@@ -51,6 +51,44 @@ export async function createSupplier(input: SupplierInput): Promise<Supplier> {
   return mapRow(rows[0]);
 }
 
+export async function updateSupplier(
+  id: string,
+  input: SupplierInput,
+): Promise<Supplier | null> {
+  const { rows } = await pool.query(
+    `
+    UPDATE suppliers
+    SET name = $2, phone = $3, email = $4, address = $5, updated_at = NOW()
+    WHERE id = $1
+    RETURNING *
+    `,
+    [id, input.name.trim(), input.phone.trim(), input.email.trim(), input.address.trim()],
+  );
+  if (!rows[0]) return null;
+
+  await pool.query(`UPDATE stock_ins SET supplier_name = $2 WHERE supplier_id = $1`, [
+    id,
+    input.name.trim(),
+  ]);
+
+  return mapRow(rows[0]);
+}
+
+export async function deleteSupplier(id: string): Promise<void> {
+  const { rows } = await pool.query(
+    `SELECT 1 FROM stock_ins WHERE supplier_id = $1 LIMIT 1`,
+    [id],
+  );
+  if (rows.length > 0) {
+    throw new Error("Cannot delete supplier with stock-in records");
+  }
+
+  const result = await pool.query(`DELETE FROM suppliers WHERE id = $1`, [id]);
+  if (result.rowCount === 0) {
+    throw new Error("Supplier not found");
+  }
+}
+
 export async function getSupplierStats() {
   const { rows } = await pool.query(`
     SELECT

@@ -1,4 +1,5 @@
 import { pool } from "../db/pool.js";
+import { formatDateOnly } from "../lib/date-only.js";
 import {
   DEFAULT_EXPIRY_ALERT_DAYS,
   daysUntilExpiry,
@@ -34,11 +35,6 @@ export type ExpiryAlert = {
 };
 
 export type NotificationAlert = StockAlert | ExpiryAlert;
-
-function formatDateOnly(value: Date | string): string {
-  if (typeof value === "string") return value.slice(0, 10);
-  return value.toISOString().slice(0, 10);
-}
 
 export function mapAlertRow(row: Record<string, unknown>): StockAlert {
   const quantity = Number(row.quantity);

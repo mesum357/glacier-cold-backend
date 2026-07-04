@@ -51,6 +51,41 @@ export async function createConsumer(input: ConsumerInput): Promise<Consumer> {
   return mapRow(rows[0]);
 }
 
+export async function getConsumerById(id: string): Promise<Consumer | null> {
+  const { rows } = await pool.query(`SELECT * FROM consumers WHERE id = $1`, [id]);
+  return rows[0] ? mapRow(rows[0]) : null;
+}
+
+export async function updateConsumer(
+  id: string,
+  input: ConsumerInput,
+): Promise<Consumer | null> {
+  const { rows } = await pool.query(
+    `
+    UPDATE consumers
+    SET name = $2, phone = $3, email = $4, address = $5, status = $6, updated_at = NOW()
+    WHERE id = $1
+    RETURNING *
+    `,
+    [
+      id,
+      input.name.trim(),
+      input.phone.trim(),
+      input.email.trim(),
+      input.address.trim(),
+      input.status,
+    ],
+  );
+  return rows[0] ? mapRow(rows[0]) : null;
+}
+
+export async function deleteConsumer(id: string): Promise<void> {
+  const result = await pool.query(`DELETE FROM consumers WHERE id = $1`, [id]);
+  if (result.rowCount === 0) {
+    throw new Error("Consumer not found");
+  }
+}
+
 export async function getConsumerStats() {
   const { rows } = await pool.query(`
     SELECT

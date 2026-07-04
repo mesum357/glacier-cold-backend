@@ -1,6 +1,9 @@
 import pg from "pg";
 
-const { Pool } = pg;
+const { Pool, types } = pg;
+
+// Return DATE columns as YYYY-MM-DD strings to avoid timezone shifts in JSON APIs.
+types.setTypeParser(1082, (value: string) => value);
 
 if (!process.env.DATABASE_URL) {
   throw new Error("DATABASE_URL is required");

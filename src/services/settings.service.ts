@@ -40,8 +40,36 @@ function mapRow(row: Record<string, unknown>): ShopSettings {
   };
 }
 
+async function ensureShopSettingsRow(): Promise<void> {
+  await pool.query(
+    `
+    INSERT INTO shop_settings (
+      id, store_name, tagline, contact_email, phone, address, currency, tax_rate, timezone, contacts
+    )
+    VALUES (
+      1,
+      'GLACIER COLD STORAGE',
+      'Shop Management',
+      'hello@glacier.shop',
+      '+92 300 1234567',
+      'Shaheed Saif Ur Rehman Hospital River View Road Gilgit',
+      'PKR',
+      0,
+      'Asia/Karachi',
+      $1
+    )
+    ON CONFLICT (id) DO NOTHING
+    `,
+    ["Rizwan Akbar: 0355-5454859\nTauqeer Ahmed: 0311-1028883"],
+  );
+}
+
 export async function getShopSettings(): Promise<ShopSettings> {
-  const { rows } = await pool.query(`SELECT * FROM shop_settings WHERE id = 1`);
+  let { rows } = await pool.query(`SELECT * FROM shop_settings WHERE id = 1`);
+  if (!rows[0]) {
+    await ensureShopSettingsRow();
+    ({ rows } = await pool.query(`SELECT * FROM shop_settings WHERE id = 1`));
+  }
   if (!rows[0]) {
     throw new Error("Shop settings not configured");
   }

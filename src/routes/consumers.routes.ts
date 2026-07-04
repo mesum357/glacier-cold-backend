@@ -3,8 +3,10 @@ import { z } from "zod";
 import { requireAuth } from "../middleware/auth.middleware.js";
 import {
   createConsumer,
+  deleteConsumer,
   getConsumerStats,
   listConsumers,
+  updateConsumer,
 } from "../services/consumers.service.js";
 
 const consumerSchema = z.object({
@@ -37,4 +39,26 @@ consumersRouter.post("/", async (req, res) => {
 
   const consumer = await createConsumer(parsed.data);
   return res.status(201).json({ consumer });
+});
+
+consumersRouter.put("/:id", async (req, res) => {
+  const parsed = consumerSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid request", details: parsed.error.flatten() });
+  }
+
+  const consumer = await updateConsumer(req.params.id, parsed.data);
+  if (!consumer) return res.status(404).json({ error: "Consumer not found" });
+  return res.json({ consumer });
+});
+
+consumersRouter.delete("/:id", async (req, res) => {
+  try {
+    await deleteConsumer(req.params.id);
+    return res.json({ ok: true });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Failed to delete consumer";
+    const status = message.includes("not found") ? 404 : 400;
+    return res.status(status).json({ error: message });
+  }
 });

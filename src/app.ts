@@ -11,6 +11,7 @@ import { stockInsRouter } from "./routes/stock-ins.routes.js";
 import { settingsRouter } from "./routes/settings.routes.js";
 import { reportsRouter } from "./routes/reports.routes.js";
 import { notificationsRouter } from "./routes/notifications.routes.js";
+import { backupRouter } from "./routes/backup.routes.js";
 
 export function createApp() {
   const app = express();
@@ -26,7 +27,7 @@ export function createApp() {
       credentials: true,
     }),
   );
-  app.use(express.json());
+  app.use(express.json({ limit: "25mb" }));
   app.use(cookieParser());
 
   app.get("/health", (_req, res) => {
@@ -42,6 +43,7 @@ export function createApp() {
   app.use("/api/settings", settingsRouter);
   app.use("/api/reports", reportsRouter);
   app.use("/api/notifications", notificationsRouter);
+  app.use("/api/backup", backupRouter);
 
   return app;
 }

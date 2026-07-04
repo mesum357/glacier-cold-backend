@@ -1,4 +1,5 @@
 import { pool } from "../db/pool.js";
+import { formatDateOnly } from "../lib/date-only.js";
 import { DEFAULT_EXPIRY_ALERT_DAYS } from "../lib/expiry.js";
 import {
   computeProductStatus,
@@ -20,6 +21,10 @@ export type Product = {
   expiryDate: string | null;
   expiryAlertDays: number | null;
   status: ProductStatus;
+  lastCartonQuantity: number | null;
+  lastCartonPrice: number | null;
+  lastSaleCartonQuantity: number | null;
+  lastSaleCartonPrice: number | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -31,16 +36,11 @@ export type ProductInput = {
   buyingPrice: number;
   sellingPrice: number;
   quantity: number;
-  thresholdLimit: number;
+  thresholdLimit: number | null;
   productionDate?: string | null;
   expiryDate?: string | null;
   expiryAlertDays?: number | null;
 };
-
-function formatDateOnly(value: Date | string): string {
-  if (typeof value === "string") return value.slice(0, 10);
-  return value.toISOString().slice(0, 10);
-}
 
 export function mapProductRow(row: Record<string, unknown>): Product {
   const quantity = Number(row.quantity);
@@ -69,6 +69,22 @@ export function mapProductRow(row: Record<string, unknown>): Product {
     expiryAlertDays:
       row.expiry_alert_days == null ? null : Number(row.expiry_alert_days),
     status,
+    lastCartonQuantity:
+      row.last_carton_quantity === null || row.last_carton_quantity === undefined
+        ? null
+        : Number(row.last_carton_quantity),
+    lastCartonPrice:
+      row.last_carton_price === null || row.last_carton_price === undefined
+        ? null
+        : Number(row.last_carton_price),
+    lastSaleCartonQuantity:
+      row.last_sale_carton_quantity === null || row.last_sale_carton_quantity === undefined
+        ? null
+        : Number(row.last_sale_carton_quantity),
+    lastSaleCartonPrice:
+      row.last_sale_carton_price === null || row.last_sale_carton_price === undefined
+        ? null
+        : Number(row.last_sale_carton_price),
     createdAt: (row.created_at as Date).toISOString(),
     updatedAt: (row.updated_at as Date).toISOString(),
   };
@@ -76,7 +92,31 @@ export function mapProductRow(row: Record<string, unknown>): Product {
 
 export async function listProducts(): Promise<Product[]> {
   const { rows } = await pool.query(
-    `SELECT * FROM products ORDER BY created_at DESC`,
+    `
+    SELECT
+      p.*,
+      latest_si.carton_quantity AS last_carton_quantity,
+      latest_si.carton_price AS last_carton_price,
+      latest_sale.carton_quantity AS last_sale_carton_quantity,
+      latest_sale.carton_price AS last_sale_carton_price
+    FROM products p
+    LEFT JOIN LATERAL (
+      SELECT carton_quantity, carton_price
+      FROM stock_ins
+      WHERE product_id = p.id
+      ORDER BY received_at DESC, created_at DESC
+      LIMIT 1
+    ) latest_si ON true
+    LEFT JOIN LATERAL (
+      SELECT si.carton_quantity, si.carton_price
+      FROM sale_items si
+      INNER JOIN sales s ON s.id = si.sale_id
+      WHERE si.product_id = p.id
+      ORDER BY s.sale_at DESC, si.line_order ASC, si.id ASC
+      LIMIT 1
+    ) latest_sale ON true
+    ORDER BY p.created_at DESC
+    `,
   );
   return rows.map(mapProductRow);
 }
@@ -98,7 +138,7 @@ export async function createProduct(input: ProductInput): Promise<Product> {
       input.buyingPrice,
       input.sellingPrice,
       input.quantity,
-      input.thresholdLimit,
+      input.thresholdLimit ?? null,
       input.productionDate ?? null,
       input.expiryDate ?? null,
       input.expiryAlertDays ?? null,
@@ -133,7 +173,7 @@ export async function updateProduct(id: string, input: ProductInput): Promise<Pr
       input.buyingPrice,
       input.sellingPrice,
       input.quantity,
-      input.thresholdLimit,
+      input.thresholdLimit ?? null,
       input.productionDate ?? null,
       input.expiryDate ?? null,
       input.expiryAlertDays ?? null,
@@ -142,9 +182,19 @@ export async function updateProduct(id: string, input: ProductInput): Promise<Pr
   return rows[0] ? mapProductRow(rows[0]) : null;
 }
 
-export async function deleteProduct(id: string): Promise<boolean> {
+export async function deleteProduct(id: string): Promise<void> {
+  const { rows: stockInRows } = await pool.query(
+    `SELECT 1 FROM stock_ins WHERE product_id = $1 LIMIT 1`,
+    [id],
+  );
+  if (stockInRows.length > 0) {
+    throw new Error("Cannot delete product with stock-in history");
+  }
+
   const { rowCount } = await pool.query(`DELETE FROM products WHERE id = $1`, [id]);
-  return (rowCount ?? 0) > 0;
+  if ((rowCount ?? 0) === 0) {
+    throw new Error("Product not found");
+  }
 }
 
 export async function listLowStockProducts(): Promise<Product[]> {
@@ -183,6 +233,75 @@ export async function listExpiringSoonProducts(): Promise<Product[]> {
     [DEFAULT_EXPIRY_ALERT_DAYS],
   );
   return rows.map(mapProductRow);
+}
+
+export type InventoryReconcileAdjustment = {
+  id: string;
+  name: string;
+  barcode: string;
+  previousQuantity: number;
+  newQuantity: number;
+  totalStockIn: number;
+  totalStockOut: number;
+  drift: number;
+};
+
+export async function reconcileInventory(): Promise<InventoryReconcileAdjustment[]> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const { rows } = await client.query(`
+      SELECT
+        p.id,
+        p.name,
+        p.barcode,
+        p.quantity AS stored,
+        COALESCE(si.total_in, 0)  AS total_in,
+        COALESCE(so.total_out, 0) AS total_out,
+        COALESCE(si.total_in, 0) - COALESCE(so.total_out, 0) AS expected
+      FROM products p
+      LEFT JOIN (
+        SELECT product_id, SUM(quantity) AS total_in
+        FROM stock_ins GROUP BY product_id
+      ) si ON si.product_id = p.id
+      LEFT JOIN (
+        SELECT product_id, SUM(quantity) AS total_out
+        FROM sale_items WHERE product_id IS NOT NULL GROUP BY product_id
+      ) so ON so.product_id = p.id
+      WHERE p.quantity <> COALESCE(si.total_in, 0) - COALESCE(so.total_out, 0)
+      ORDER BY ABS(p.quantity - (COALESCE(si.total_in, 0) - COALESCE(so.total_out, 0))) DESC
+      FOR UPDATE OF p
+    `);
+
+    const adjustments: InventoryReconcileAdjustment[] = [];
+    for (const row of rows) {
+      const stored = Number(row.stored);
+      const expected = Number(row.expected);
+      await client.query(
+        `UPDATE products SET quantity = $2, updated_at = NOW() WHERE id = $1`,
+        [row.id, expected],
+      );
+      adjustments.push({
+        id: row.id as string,
+        name: row.name as string,
+        barcode: row.barcode as string,
+        previousQuantity: stored,
+        newQuantity: expected,
+        totalStockIn: Number(row.total_in),
+        totalStockOut: Number(row.total_out),
+        drift: stored - expected,
+      });
+    }
+
+    await client.query("COMMIT");
+    return adjustments;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 export async function getProductStats() {
