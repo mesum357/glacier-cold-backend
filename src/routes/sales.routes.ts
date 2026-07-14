@@ -3,11 +3,13 @@ import { z } from "zod";
 import { requireAuth } from "../middleware/auth.middleware.js";
 import { PAYMENT_STATUSES } from "../lib/payment-status.js";
 import {
+  applyAdvanceToConsumer,
   createSale,
   getSaleById,
   getSalesSummary,
   listRecentSales,
   listSales,
+  softDeleteSale,
   updateSale,
   updateSalePaymentStatus,
 } from "../services/sales.service.js";
@@ -31,6 +33,11 @@ const createSaleSchema = z.object({
 
 const updatePaymentStatusSchema = z.object({
   paymentStatus: z.enum(PAYMENT_STATUSES),
+});
+
+const applyAdvanceSchema = z.object({
+  consumerId: z.string().uuid(),
+  amount: z.number().positive(),
 });
 
 export const salesRouter = Router();
@@ -68,6 +75,22 @@ salesRouter.get("/recent", async (req, res) => {
   const limit = req.query.limit ? Number(req.query.limit) : 20;
   const sales = await listRecentSales(Number.isFinite(limit) ? limit : 20);
   return res.json({ sales });
+});
+
+salesRouter.post("/apply-advance", async (req, res) => {
+  const parsed = applyAdvanceSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid request", details: parsed.error.flatten() });
+  }
+
+  try {
+    const result = await applyAdvanceToConsumer(parsed.data.consumerId, parsed.data.amount);
+    return res.json({ result });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Failed to apply advance";
+    const status = message === "Consumer not found" ? 404 : 400;
+    return res.status(status).json({ error: message });
+  }
 });
 
 salesRouter.get("/:id", async (req, res) => {
@@ -116,4 +139,15 @@ salesRouter.patch("/:id/payment-status", async (req, res) => {
   const sale = await updateSalePaymentStatus(req.params.id, parsed.data.paymentStatus);
   if (!sale) return res.status(404).json({ error: "Sale not found" });
   return res.json({ sale });
+});
+
+salesRouter.delete("/:id", async (req, res) => {
+  try {
+    const sale = await softDeleteSale(req.params.id);
+    return res.json({ sale });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Failed to remove invoice";
+    const status = message === "Sale not found" ? 404 : 400;
+    return res.status(status).json({ error: message });
+  }
 });

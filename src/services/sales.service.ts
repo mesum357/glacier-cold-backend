@@ -1,6 +1,11 @@
 import { pool } from "../db/pool.js";
+import {
+  allocateAdvanceFifo,
+  type AdvanceAllocation,
+} from "../lib/apply-advance.js";
 import { roundMoney, saleLineTotal, validateAdvanceAmount } from "../lib/money.js";
 import { type PaymentStatus } from "../lib/payment-status.js";
+import { getConsumerById } from "./consumers.service.js";
 import { allocateSalesInvoiceNo } from "./invoice-no.service.js";
 import { aggregateSaleItems, validateSaleQuantity } from "./sales.validation.js";
 
@@ -29,6 +34,7 @@ export type Sale = {
   paymentStatus: PaymentStatus;
   items: SaleItem[];
   createdAt: string;
+  deletedAt: string | null;
 };
 
 export type SaleItemInput = {
@@ -92,6 +98,7 @@ function mapSale(row: Record<string, unknown>, items: SaleItem[]): Sale {
     paymentStatus: row.payment_status as PaymentStatus,
     items,
     createdAt: (row.created_at as Date).toISOString(),
+    deletedAt: row.deleted_at ? (row.deleted_at as Date).toISOString() : null,
   };
 }
 
@@ -152,11 +159,14 @@ function periodToRange(period: string, year: number): { from: Date; to: Date } |
   return null;
 }
 
-async function fetchSalesByIds(ids: string[]): Promise<Sale[]> {
+async function fetchSalesByIds(ids: string[], options: { includeDeleted?: boolean } = {}): Promise<Sale[]> {
   if (ids.length === 0) return [];
 
+  const includeDeleted = options.includeDeleted === true;
   const { rows: saleRows } = await pool.query(
-    `SELECT * FROM sales WHERE id = ANY($1::uuid[]) ORDER BY sale_at DESC`,
+    includeDeleted
+      ? `SELECT * FROM sales WHERE id = ANY($1::uuid[]) ORDER BY sale_at DESC`
+      : `SELECT * FROM sales WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL ORDER BY sale_at DESC`,
     [ids],
   );
 
@@ -204,7 +214,7 @@ export async function updateSale(id: string, input: CreateSaleInput): Promise<Sa
     await client.query("BEGIN");
 
     const { rows: saleRows } = await client.query(
-      `SELECT * FROM sales WHERE id = $1 FOR UPDATE`,
+      `SELECT * FROM sales WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`,
       [id],
     );
     const existingSale = saleRows[0];
@@ -462,14 +472,14 @@ export async function createSale(input: CreateSaleInput): Promise<Sale> {
 
 export async function listRecentSales(limit = 20): Promise<Sale[]> {
   const { rows } = await pool.query(
-    `SELECT id FROM sales ORDER BY sale_at DESC LIMIT $1`,
+    `SELECT id FROM sales WHERE deleted_at IS NULL ORDER BY sale_at DESC LIMIT $1`,
     [limit],
   );
   return fetchSalesByIds(rows.map((r) => r.id as string));
 }
 
 export async function listSales(filters: SaleFilters = {}): Promise<Sale[]> {
-  const conditions: string[] = [];
+  const conditions: string[] = [`s.deleted_at IS NULL`];
   const params: unknown[] = [];
   let idx = 1;
 
@@ -545,7 +555,7 @@ export async function updateSalePaymentStatus(
       `
       UPDATE sales
       SET payment_status = $2
-      WHERE id = $1
+      WHERE id = $1 AND deleted_at IS NULL
       RETURNING *
       `,
       [id, paymentStatus],
@@ -565,6 +575,156 @@ export async function updateSalePaymentStatus(
     return sales[0] ?? null;
   } catch (err) {
     await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+export type ApplyAdvanceResult = {
+  partyName: string;
+  amount: number;
+  appliedTotal: number;
+  remainder: number;
+  allocations: AdvanceAllocation[];
+  sales: Sale[];
+};
+
+/** Apply a payment to a consumer's earliest unpaid sales invoices (FIFO). */
+export async function applyAdvanceToConsumer(
+  consumerId: string,
+  amount: number,
+): Promise<ApplyAdvanceResult> {
+  const payment = roundMoney(amount);
+  if (!Number.isFinite(payment) || payment <= 0) {
+    throw new Error("Advance amount must be greater than zero");
+  }
+
+  const consumer = await getConsumerById(consumerId);
+  if (!consumer) {
+    throw new Error("Consumer not found");
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const { rows } = await client.query(
+      `
+      SELECT id, invoice_no, total_amount, advance_amount, payment_status
+      FROM sales
+      WHERE supplier_name = $1
+        AND deleted_at IS NULL
+        AND payment_status IN ('pending', 'half_paid')
+      ORDER BY sale_at ASC, invoice_no ASC
+      FOR UPDATE
+      `,
+      [consumer.name],
+    );
+
+    const pending = rows.map((row) => ({
+      id: row.id as string,
+      invoiceNo: Number(row.invoice_no),
+      total: Number(row.total_amount),
+      advanceAmount: Number(row.advance_amount ?? 0),
+      paymentStatus: row.payment_status as PaymentStatus,
+    }));
+
+    const { allocations, remainder, appliedTotal } = allocateAdvanceFifo(pending, payment);
+
+    if (allocations.length === 0) {
+      throw new Error("No unpaid invoices found for this consumer");
+    }
+
+    for (const allocation of allocations) {
+      await client.query(
+        `
+        UPDATE sales
+        SET advance_amount = $2, payment_status = $3
+        WHERE id = $1
+        `,
+        [allocation.id, allocation.newAdvance, allocation.newStatus],
+      );
+      await client.query(
+        `UPDATE sale_items SET payment_status = $2 WHERE sale_id = $1`,
+        [allocation.id, allocation.newStatus],
+      );
+    }
+
+    await client.query("COMMIT");
+
+    const sales = await fetchSalesByIds(allocations.map((a) => a.id));
+    return {
+      partyName: consumer.name,
+      amount: payment,
+      appliedTotal,
+      remainder,
+      allocations,
+      sales,
+    };
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      // Transaction may already be closed.
+    }
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Hide a stock-out invoice from the website without removing the DB row.
+ * Restores product quantities so inventory matches the corrected history.
+ */
+export async function softDeleteSale(id: string): Promise<Sale> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const { rows: saleRows } = await client.query(
+      `SELECT * FROM sales WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`,
+      [id],
+    );
+    const existingSale = saleRows[0];
+    if (!existingSale) {
+      throw new Error("Sale not found");
+    }
+
+    const { rows: itemRows } = await client.query(
+      `SELECT * FROM sale_items WHERE sale_id = $1 FOR UPDATE`,
+      [id],
+    );
+
+    for (const item of itemRows) {
+      if (!item.product_id) continue;
+      await client.query(
+        `UPDATE products SET quantity = quantity + $2, updated_at = NOW() WHERE id = $1`,
+        [item.product_id, item.quantity],
+      );
+    }
+
+    const { rows: updatedRows } = await client.query(
+      `
+      UPDATE sales
+      SET deleted_at = NOW()
+      WHERE id = $1
+      RETURNING *
+      `,
+      [id],
+    );
+
+    await client.query("COMMIT");
+
+    const deleted = mapSale(updatedRows[0], itemRows.map(mapSaleItem));
+    return deleted;
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      // Transaction may already be closed.
+    }
     throw err;
   } finally {
     client.release();

@@ -1,4 +1,8 @@
 import { pool } from "../db/pool.js";
+import {
+  allocateAdvanceFifo,
+  type AdvanceAllocation,
+} from "../lib/apply-advance.js";
 import { formatDateOnly } from "../lib/date-only.js";
 import { roundMoney, validateAdvanceAmount } from "../lib/money.js";
 import { type PaymentStatus } from "../lib/payment-status.js";
@@ -706,4 +710,119 @@ export async function updateStockInPaymentStatus(
   );
   const updated = rows.find((row) => row.id === id);
   return updated ? mapRow(updated) : rows[0] ? mapRow(rows[0]) : null;
+}
+
+export type ApplyStockInAdvanceResult = {
+  partyName: string;
+  amount: number;
+  appliedTotal: number;
+  remainder: number;
+  allocations: AdvanceAllocation[];
+  stockIns: StockIn[];
+};
+
+/** Apply a payment to a supplier's earliest unpaid stock-in invoices (FIFO). */
+export async function applyAdvanceToSupplier(
+  supplierId: string,
+  amount: number,
+): Promise<ApplyStockInAdvanceResult> {
+  const payment = roundMoney(amount);
+  if (!Number.isFinite(payment) || payment <= 0) {
+    throw new Error("Advance amount must be greater than zero");
+  }
+
+  const supplier = await getSupplierById(supplierId);
+  if (!supplier) {
+    throw new Error("Supplier not found");
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    await client.query(
+      `
+      SELECT id
+      FROM stock_ins
+      WHERE supplier_id = $1
+        AND payment_status IN ('pending', 'half_paid')
+      ORDER BY received_at ASC, invoice_no ASC, line_order ASC
+      FOR UPDATE
+      `,
+      [supplierId],
+    );
+
+    const { rows } = await client.query(
+      `
+      SELECT
+        invoice_no,
+        MIN(received_at) AS received_at,
+        MAX(advance_amount)::numeric AS advance_amount,
+        (ARRAY_AGG(payment_status ORDER BY line_order ASC, id ASC))[1] AS payment_status,
+        SUM(quantity * buying_price)::numeric AS total
+      FROM stock_ins
+      WHERE supplier_id = $1
+        AND payment_status IN ('pending', 'half_paid')
+      GROUP BY invoice_no
+      ORDER BY MIN(received_at) ASC, invoice_no ASC
+      `,
+      [supplierId],
+    );
+
+    const pending = rows.map((row) => ({
+      id: String(row.invoice_no),
+      invoiceNo: Number(row.invoice_no),
+      total: Number(row.total),
+      advanceAmount: Number(row.advance_amount ?? 0),
+      paymentStatus: row.payment_status as PaymentStatus,
+    }));
+
+    const { allocations, remainder, appliedTotal } = allocateAdvanceFifo(pending, payment);
+
+    if (allocations.length === 0) {
+      throw new Error("No unpaid invoices found for this supplier");
+    }
+
+    for (const allocation of allocations) {
+      await client.query(
+        `
+        UPDATE stock_ins
+        SET advance_amount = $2, payment_status = $3
+        WHERE invoice_no = $1
+        `,
+        [allocation.invoiceNo, allocation.newAdvance, allocation.newStatus],
+      );
+    }
+
+    await client.query("COMMIT");
+
+    const invoiceNos = allocations.map((a) => a.invoiceNo);
+    const { rows: updatedRows } = await pool.query(
+      `
+      SELECT *
+      FROM stock_ins
+      WHERE invoice_no = ANY($1::int[])
+      ORDER BY received_at ASC, invoice_no ASC, line_order ASC, id ASC
+      `,
+      [invoiceNos],
+    );
+
+    return {
+      partyName: supplier.name,
+      amount: payment,
+      appliedTotal,
+      remainder,
+      allocations,
+      stockIns: updatedRows.map(mapRow),
+    };
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      // Transaction may already be closed.
+    }
+    throw err;
+  } finally {
+    client.release();
+  }
 }

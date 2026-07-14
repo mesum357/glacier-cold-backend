@@ -70,6 +70,7 @@ export const INSERT_COLUMNS: Record<
     "invoice_no",
     "payment_status",
     "advance_amount",
+    "deleted_at",
   ],
   sale_items: [
     "id",
@@ -354,6 +355,13 @@ function withPaymentStatus(rows: Record<string, unknown>[]): Record<string, unkn
   }));
 }
 
+function withSalesSoftDelete(rows: Record<string, unknown>[]): Record<string, unknown>[] {
+  return rows.map((row) => ({
+    ...row,
+    deleted_at: row.deleted_at ?? null,
+  }));
+}
+
 function withNullableCartonFields(rows: Record<string, unknown>[]): Record<string, unknown>[] {
   return rows.map((row) => ({
     ...row,
@@ -407,7 +415,7 @@ export function prepareTablesForRestore(tables: BackupTables): BackupTables {
   const withMissing = assignMissingInvoiceNumbers(tables.sales, tables.stock_ins);
   const invoiceResult = renumberInvoiceNumbersSeparately(withMissing.sales, withMissing.stockIns);
 
-  const sales = withPaymentStatus(invoiceResult.sales);
+  const sales = withSalesSoftDelete(withPaymentStatus(invoiceResult.sales));
   const stockIns = withNullableCartonFields(
     withStockInOptionalDates(
       assignLineOrder(withPaymentStatus(invoiceResult.stockIns), "invoice_no"),

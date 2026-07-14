@@ -3,6 +3,7 @@ import { requireAuth } from "../middleware/auth.middleware.js";
 import { isPartyReportPeriod, type PartyReportPeriod } from "../lib/report-periods.js";
 import {
   getConsumerReport,
+  getMonthlyReport,
   getReports,
   getSupplierReport,
 } from "../services/reports.service.js";
@@ -28,6 +29,14 @@ function parseYear(value: unknown): number | undefined {
   return undefined;
 }
 
+function parseMonth(value: unknown): number | undefined {
+  const num = typeof value === "string" ? Number(value) : typeof value === "number" ? value : NaN;
+  if (Number.isInteger(num) && num >= 1 && num <= 12) {
+    return num;
+  }
+  return undefined;
+}
+
 reportsRouter.get("/", async (req, res) => {
   const date = typeof req.query.date === "string" ? req.query.date : undefined;
   try {
@@ -36,6 +45,25 @@ reportsRouter.get("/", async (req, res) => {
   } catch (err) {
     console.error("GET /api/reports failed:", err);
     const message = err instanceof Error ? err.message : "Failed to load reports";
+    return res.status(500).json({ error: message });
+  }
+});
+
+reportsRouter.get("/monthly", async (req, res) => {
+  const allTime = req.query.all === "true" || req.query.all === "1";
+  const month = parseMonth(req.query.month);
+  const year = parseYear(req.query.year) ?? new Date().getFullYear();
+
+  if (!allTime && (month == null || parseYear(req.query.year) == null)) {
+    return res.status(400).json({ error: "month (1-12) and year are required" });
+  }
+
+  try {
+    const report = await getMonthlyReport(month ?? 0, year, allTime);
+    return res.json({ report });
+  } catch (err) {
+    console.error("GET /api/reports/monthly failed:", err);
+    const message = err instanceof Error ? err.message : "Failed to load monthly report";
     return res.status(500).json({ error: message });
   }
 });

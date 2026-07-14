@@ -11,9 +11,16 @@ export type PartyReportPeriod =
   | "this_week"
   | "this_month"
   | "year"
+  | "all_time"
   | `month-${number}`;
 
-const PARTY_PERIOD_SET = new Set<string>(["today", "this_week", "this_month", "year"]);
+const PARTY_PERIOD_SET = new Set<string>([
+  "today",
+  "this_week",
+  "this_month",
+  "year",
+  "all_time",
+]);
 
 export function isPartyReportPeriod(value: string): value is PartyReportPeriod {
   if (PARTY_PERIOD_SET.has(value)) return true;
@@ -25,6 +32,7 @@ export function partyPeriodLabel(period: PartyReportPeriod, year?: number): stri
   if (period === "this_week") return "Weekly";
   if (period === "this_month") return "Monthly";
   if (period === "year") return year ? `Year ${year}` : "Yearly";
+  if (period === "all_time") return "All time";
   const monthMatch = period.match(/^month-(\d{1,2})$/);
   if (monthMatch) {
     const month = Number(monthMatch[1]);
@@ -79,6 +87,10 @@ export function partySaleDateRangeSql(period: string): string {
   const saleDate = `(s.sale_at AT TIME ZONE $1)::date`;
   const anchor = `$2::date`;
 
+  if (period === "all_time") {
+    // No date bound — reference $1 so the timezone param stays used.
+    return `(s.sale_at AT TIME ZONE $1) IS NOT NULL`;
+  }
   if (period === "today") {
     return `${saleDate} = ${anchor}`;
   }
@@ -89,12 +101,12 @@ export function partySaleDateRangeSql(period: string): string {
     return `${saleDate} >= date_trunc('month', ${anchor})::date AND ${saleDate} < (date_trunc('month', ${anchor}) + INTERVAL '1 month')::date`;
   }
   if (period === "year") {
-    return `${saleDate} >= make_date($3::int, 1, 1) AND ${saleDate} < make_date(($3::int + 1), 1, 1)`;
+    return `${saleDate} >= make_date($2::int, 1, 1) AND ${saleDate} < make_date(($2::int + 1), 1, 1)`;
   }
   const monthMatch = period.match(/^month-(\d{1,2})$/);
   if (monthMatch) {
     const month = Number(monthMatch[1]);
-    return `${saleDate} >= make_date($3::int, ${month}::int, 1) AND ${saleDate} < (make_date($3::int, ${month}::int, 1) + INTERVAL '1 month')::date`;
+    return `${saleDate} >= make_date($2::int, ${month}::int, 1) AND ${saleDate} < (make_date($2::int, ${month}::int, 1) + INTERVAL '1 month')::date`;
   }
   return `${saleDate} = ${anchor}`;
 }
@@ -103,6 +115,10 @@ export function partyPurchaseDateRangeSql(period: string): string {
   const receivedDate = `(si.received_at AT TIME ZONE $1)::date`;
   const anchor = `$2::date`;
 
+  if (period === "all_time") {
+    // No date bound — reference $1 so the timezone param stays used.
+    return `(si.received_at AT TIME ZONE $1) IS NOT NULL`;
+  }
   if (period === "today") {
     return `${receivedDate} = ${anchor}`;
   }
@@ -113,12 +129,12 @@ export function partyPurchaseDateRangeSql(period: string): string {
     return `${receivedDate} >= date_trunc('month', ${anchor})::date AND ${receivedDate} < (date_trunc('month', ${anchor}) + INTERVAL '1 month')::date`;
   }
   if (period === "year") {
-    return `${receivedDate} >= make_date($3::int, 1, 1) AND ${receivedDate} < make_date(($3::int + 1), 1, 1)`;
+    return `${receivedDate} >= make_date($2::int, 1, 1) AND ${receivedDate} < make_date(($2::int + 1), 1, 1)`;
   }
   const monthMatch = period.match(/^month-(\d{1,2})$/);
   if (monthMatch) {
     const month = Number(monthMatch[1]);
-    return `${receivedDate} >= make_date($3::int, ${month}::int, 1) AND ${receivedDate} < (make_date($3::int, ${month}::int, 1) + INTERVAL '1 month')::date`;
+    return `${receivedDate} >= make_date($2::int, ${month}::int, 1) AND ${receivedDate} < (make_date($2::int, ${month}::int, 1) + INTERVAL '1 month')::date`;
   }
   return `${receivedDate} = ${anchor}`;
 }
@@ -130,8 +146,16 @@ export function partyPeriodQueryParams(
   year?: number,
   entityValue?: string,
 ): unknown[] {
-  const needsYear = period === "year" || /^month-\d{1,2}$/.test(period);
-  const base = needsYear && year != null ? [timezone, reportDate, year] : [timezone, reportDate];
+  const isMonthOrYear = period === "year" || /^month-\d{1,2}$/.test(period);
+  let base: unknown[];
+  if (period === "all_time") {
+    // all_time SQL only references $1 (timezone).
+    base = [timezone];
+  } else if (isMonthOrYear && year != null) {
+    base = [timezone, year];
+  } else {
+    base = [timezone, reportDate];
+  }
   if (entityValue != null) {
     return [...base, entityValue];
   }

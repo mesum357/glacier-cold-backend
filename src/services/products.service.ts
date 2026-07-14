@@ -112,6 +112,7 @@ export async function listProducts(): Promise<Product[]> {
       FROM sale_items si
       INNER JOIN sales s ON s.id = si.sale_id
       WHERE si.product_id = p.id
+        AND s.deleted_at IS NULL
       ORDER BY s.sale_at DESC, si.line_order ASC, si.id ASC
       LIMIT 1
     ) latest_sale ON true
@@ -266,8 +267,12 @@ export async function reconcileInventory(): Promise<InventoryReconcileAdjustment
         FROM stock_ins GROUP BY product_id
       ) si ON si.product_id = p.id
       LEFT JOIN (
-        SELECT product_id, SUM(quantity) AS total_out
-        FROM sale_items WHERE product_id IS NOT NULL GROUP BY product_id
+        SELECT si.product_id, SUM(si.quantity) AS total_out
+        FROM sale_items si
+        INNER JOIN sales s ON s.id = si.sale_id
+        WHERE si.product_id IS NOT NULL
+          AND s.deleted_at IS NULL
+        GROUP BY si.product_id
       ) so ON so.product_id = p.id
       WHERE p.quantity <> COALESCE(si.total_in, 0) - COALESCE(so.total_out, 0)
       ORDER BY ABS(p.quantity - (COALESCE(si.total_in, 0) - COALESCE(so.total_out, 0))) DESC

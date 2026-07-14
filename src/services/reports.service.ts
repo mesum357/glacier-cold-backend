@@ -1,5 +1,6 @@
 import { pool } from "../db/pool.js";
 import { formatDateOnly } from "../lib/date-only.js";
+import { invoiceBalance, roundMoney } from "../lib/money.js";
 import type { PaymentStatus } from "../lib/payment-status.js";
 import {
   isPartyReportPeriod,
@@ -41,6 +42,7 @@ export type DailySalesLine = {
   saleAt: string;
   paymentStatus: PaymentStatus;
   totalAmount: number;
+  advanceAmount: number;
   productName: string;
   quantity: number;
   unitPrice: number;
@@ -67,6 +69,7 @@ export type DailyPurchaseLine = {
   quantity: number;
   buyingPrice: number;
   lineTotal: number;
+  advanceAmount: number;
   productionDate: string | null;
   expiryDate: string | null;
   paymentStatus: PaymentStatus;
@@ -115,6 +118,10 @@ export type PartyReportMetrics = {
   grossProfit: number;
   marginPercent: number | null;
   purchases: number;
+  /** Sum of amounts paid (invoice advances) in the period. */
+  amountPaid: number;
+  /** Sum of remaining balances (invoice total − advance) in the period. */
+  remainingBalance: number;
   transactionCount: number;
   lineCount: number;
 };
@@ -156,6 +163,20 @@ export type SupplierReportData = {
   purchases: DailyPurchaseLine[];
 };
 
+export type MonthlyReportData = {
+  reportDate: string;
+  timezone: string;
+  month: number;
+  year: number;
+  periodLabel: string;
+  periodStart: string;
+  periodEnd: string;
+  salesMetrics: PartyReportMetrics;
+  purchaseMetrics: PartyReportMetrics;
+  sales: DailySalesLine[];
+  purchases: DailyPurchaseLine[];
+};
+
 type SalePeriod = ReportPeriod;
 type PurchasePeriod = ReportPeriod;
 
@@ -169,6 +190,10 @@ async function resolvePartyPeriodBounds(
   reportDate: string,
   year?: number,
 ): Promise<PeriodBounds> {
+  if (period === "all_time") {
+    return { start: "", end: "", label: "All time" };
+  }
+
   if (period === "year" && year != null) {
     return {
       start: `${year}-01-01`,
@@ -256,6 +281,7 @@ async function sumSalesMetricsForPeriod(
     INNER JOIN sales s ON s.id = si.sale_id
     LEFT JOIN products p ON p.id = si.product_id
     WHERE ${saleDateRangeSql(period, reportDate)}
+    AND s.deleted_at IS NULL
     ${consumerFilter}
     `,
     params,
@@ -317,7 +343,8 @@ async function dailyGrossProfitChart(
       FROM sale_items si
       INNER JOIN sales s ON s.id = si.sale_id
       LEFT JOIN products p ON p.id = si.product_id
-      WHERE (s.sale_at AT TIME ZONE $1)::date >= (${anchor} - INTERVAL '6 days')::date
+      WHERE s.deleted_at IS NULL
+        AND (s.sale_at AT TIME ZONE $1)::date >= (${anchor} - INTERVAL '6 days')::date
         AND (s.sale_at AT TIME ZONE $1)::date <= ${anchor}::date
       GROUP BY day
     )
@@ -357,7 +384,8 @@ async function weeklyGrossProfitChart(
       FROM sale_items si
       INNER JOIN sales s ON s.id = si.sale_id
       LEFT JOIN products p ON p.id = si.product_id
-      WHERE (s.sale_at AT TIME ZONE $1)::date >= (date_trunc('week', ${anchor}) - INTERVAL '6 weeks')::date
+      WHERE s.deleted_at IS NULL
+        AND (s.sale_at AT TIME ZONE $1)::date >= (date_trunc('week', ${anchor}) - INTERVAL '6 weeks')::date
         AND (s.sale_at AT TIME ZONE $1)::date < (date_trunc('week', ${anchor}) + INTERVAL '7 days')::date
       GROUP BY week_start
     )
@@ -397,7 +425,8 @@ async function monthlyGrossProfitChart(
       FROM sale_items si
       INNER JOIN sales s ON s.id = si.sale_id
       LEFT JOIN products p ON p.id = si.product_id
-      WHERE (s.sale_at AT TIME ZONE $1)::date >= (date_trunc('month', ${anchor}) - INTERVAL '6 months')::date
+      WHERE s.deleted_at IS NULL
+        AND (s.sale_at AT TIME ZONE $1)::date >= (date_trunc('month', ${anchor}) - INTERVAL '6 months')::date
         AND (s.sale_at AT TIME ZONE $1)::date < (date_trunc('month', ${anchor}) + INTERVAL '1 month')::date
       GROUP BY month_start
     )
@@ -466,6 +495,7 @@ async function getPartySalesReportLines(
       s.sale_at,
       s.payment_status AS sale_payment_status,
       s.total_amount,
+      s.advance_amount,
       s.supplier_name,
       si.product_name,
       si.quantity,
@@ -488,6 +518,7 @@ async function getPartySalesReportLines(
       LIMIT 1
     ) c ON true
     WHERE ${partySaleDateRangeSql(period)}
+    AND s.deleted_at IS NULL
     ${consumerFilter}
     ORDER BY s.sale_at DESC, s.invoice_no DESC, si.line_order ASC, si.id ASC
     `,
@@ -505,6 +536,7 @@ async function getPartySalesReportLines(
       saleAt: (r.sale_at as Date).toISOString(),
       paymentStatus: r.sale_payment_status as PaymentStatus,
       totalAmount: Number(r.total_amount),
+      advanceAmount: Number(r.advance_amount ?? 0),
       productName: r.product_name as string,
       quantity,
       unitPrice: Number(r.unit_price),
@@ -544,6 +576,7 @@ async function getPartyPurchaseReportLines(
       si.product_category,
       si.quantity,
       si.buying_price,
+      si.advance_amount,
       si.production_date,
       si.expiry_date,
       si.payment_status,
@@ -570,6 +603,7 @@ async function getPartyPurchaseReportLines(
     quantity: Number(r.quantity),
     buyingPrice: Number(r.buying_price),
     lineTotal: Number(r.buying_price) * Number(r.quantity),
+    advanceAmount: Number(r.advance_amount ?? 0),
     productionDate: r.production_date
       ? formatDateOnly(r.production_date as Date | string)
       : null,
@@ -602,6 +636,7 @@ async function getSalesReportLines(
       s.sale_at,
       s.payment_status AS sale_payment_status,
       s.total_amount,
+      s.advance_amount,
       s.supplier_name,
       si.product_name,
       si.quantity,
@@ -624,6 +659,7 @@ async function getSalesReportLines(
       LIMIT 1
     ) c ON true
     WHERE ${saleDateRangeSql(period, reportDate)}
+    AND s.deleted_at IS NULL
     ${consumerFilter}
     ORDER BY s.sale_at DESC, s.invoice_no DESC, si.line_order ASC, si.id ASC
     `,
@@ -641,6 +677,7 @@ async function getSalesReportLines(
       saleAt: (r.sale_at as Date).toISOString(),
       paymentStatus: r.sale_payment_status as PaymentStatus,
       totalAmount: Number(r.total_amount),
+      advanceAmount: Number(r.advance_amount ?? 0),
       productName: r.product_name as string,
       quantity,
       unitPrice: Number(r.unit_price),
@@ -683,6 +720,7 @@ async function getPurchaseReportLines(
       si.product_category,
       si.quantity,
       si.buying_price,
+      si.advance_amount,
       si.production_date,
       si.expiry_date,
       si.payment_status,
@@ -709,6 +747,7 @@ async function getPurchaseReportLines(
     quantity: Number(r.quantity),
     buyingPrice: Number(r.buying_price),
     lineTotal: Number(r.buying_price) * Number(r.quantity),
+    advanceAmount: Number(r.advance_amount ?? 0),
     productionDate: r.production_date
       ? formatDateOnly(r.production_date as Date | string)
       : null,
@@ -766,17 +805,56 @@ async function resolveReportDate(timezone: string, date?: string): Promise<strin
   return rows[0].today as string;
 }
 
+function ledgerTotalsFromInvoices(
+  invoices: Iterable<{ total: number; advance: number; paymentStatus: PaymentStatus }>,
+): { amountPaid: number; remainingBalance: number } {
+  let amountPaid = 0;
+  let remainingBalance = 0;
+  for (const invoice of invoices) {
+    const credit =
+      invoice.paymentStatus === "paid"
+        ? roundMoney(Math.max(invoice.advance, invoice.total))
+        : roundMoney(invoice.advance);
+    amountPaid = roundMoney(amountPaid + credit);
+    remainingBalance = roundMoney(
+      remainingBalance + invoiceBalance(invoice.total, credit),
+    );
+  }
+  return { amountPaid, remainingBalance };
+}
+
 function buildPartyMetricsFromSales(sales: DailySalesLine[]): PartyReportMetrics {
   const revenue = sales.reduce((sum, line) => sum + line.lineTotal, 0);
   const cogs = sales.reduce((sum, line) => sum + line.lineCogs, 0);
   const grossProfit = revenue - cogs;
   const transactionCount = new Set(sales.map((line) => line.saleId)).size;
+
+  const bySale = new Map<
+    string,
+    { total: number; advance: number; paymentStatus: PaymentStatus }
+  >();
+  for (const line of sales) {
+    const existing = bySale.get(line.saleId);
+    if (!existing) {
+      bySale.set(line.saleId, {
+        total: line.lineTotal,
+        advance: line.advanceAmount,
+        paymentStatus: line.paymentStatus,
+      });
+      continue;
+    }
+    existing.total = roundMoney(existing.total + line.lineTotal);
+  }
+  const { amountPaid, remainingBalance } = ledgerTotalsFromInvoices(bySale.values());
+
   return {
     revenue,
     cogs,
     grossProfit,
     marginPercent: marginPercent(revenue, grossProfit),
     purchases: 0,
+    amountPaid,
+    remainingBalance,
     transactionCount,
     lineCount: sales.length,
   };
@@ -785,12 +863,33 @@ function buildPartyMetricsFromSales(sales: DailySalesLine[]): PartyReportMetrics
 function buildPartyMetricsFromPurchases(purchases: DailyPurchaseLine[]): PartyReportMetrics {
   const total = purchases.reduce((sum, line) => sum + line.lineTotal, 0);
   const transactionCount = new Set(purchases.map((line) => line.invoiceNo)).size;
+
+  const byInvoice = new Map<
+    number,
+    { total: number; advance: number; paymentStatus: PaymentStatus }
+  >();
+  for (const line of purchases) {
+    const existing = byInvoice.get(line.invoiceNo);
+    if (!existing) {
+      byInvoice.set(line.invoiceNo, {
+        total: line.lineTotal,
+        advance: line.advanceAmount,
+        paymentStatus: line.paymentStatus,
+      });
+      continue;
+    }
+    existing.total = roundMoney(existing.total + line.lineTotal);
+  }
+  const { amountPaid, remainingBalance } = ledgerTotalsFromInvoices(byInvoice.values());
+
   return {
     revenue: 0,
     cogs: 0,
     grossProfit: 0,
     marginPercent: null,
     purchases: total,
+    amountPaid,
+    remainingBalance,
     transactionCount,
     lineCount: purchases.length,
   };
@@ -879,6 +978,39 @@ export async function getSupplierReport(
       address: supplier.address as string,
     },
     metrics: buildPartyMetricsFromPurchases(purchases),
+    purchases,
+  };
+}
+
+export async function getMonthlyReport(
+  month: number,
+  year: number,
+  allTime = false,
+): Promise<MonthlyReportData> {
+  const settings = await getShopSettings();
+  const tz = settings.timezone;
+  const anchorDate = allTime ? undefined : `${year}-${String(month).padStart(2, "0")}-01`;
+  const reportDate = await resolveReportDate(tz, anchorDate);
+  const period = (allTime ? "all_time" : `month-${month}`) as PartyReportPeriod;
+  const filterYear = allTime ? undefined : year;
+
+  const [sales, purchases, bounds] = await Promise.all([
+    getPartySalesReportLines(tz, period, reportDate, filterYear),
+    getPartyPurchaseReportLines(tz, period, reportDate, filterYear),
+    resolvePartyPeriodBounds(period, reportDate, filterYear),
+  ]);
+
+  return {
+    reportDate,
+    timezone: tz,
+    month: allTime ? 0 : month,
+    year,
+    periodLabel: bounds.label,
+    periodStart: bounds.start,
+    periodEnd: bounds.end,
+    salesMetrics: buildPartyMetricsFromSales(sales),
+    purchaseMetrics: buildPartyMetricsFromPurchases(purchases),
+    sales,
     purchases,
   };
 }

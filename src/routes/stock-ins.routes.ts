@@ -3,6 +3,7 @@ import { z } from "zod";
 import { requireAuth } from "../middleware/auth.middleware.js";
 import { PAYMENT_STATUSES } from "../lib/payment-status.js";
 import {
+  applyAdvanceToSupplier,
   createStockIn,
   createStockInBatch,
   getStockInBatchByInvoiceNo,
@@ -50,6 +51,11 @@ const updatePaymentStatusSchema = z.object({
   paymentStatus: z.enum(PAYMENT_STATUSES),
 });
 
+const applyAdvanceSchema = z.object({
+  supplierId: z.string().uuid(),
+  amount: z.number().positive(),
+});
+
 export const stockInsRouter = Router();
 
 stockInsRouter.use(requireAuth);
@@ -83,6 +89,22 @@ stockInsRouter.get("/recent", async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 20, 100);
   const stockIns = await listRecentStockIns(limit);
   return res.json({ stockIns });
+});
+
+stockInsRouter.post("/apply-advance", async (req, res) => {
+  const parsed = applyAdvanceSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid request", details: parsed.error.flatten() });
+  }
+
+  try {
+    const result = await applyAdvanceToSupplier(parsed.data.supplierId, parsed.data.amount);
+    return res.json({ result });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Failed to apply advance";
+    const status = message === "Supplier not found" ? 404 : 400;
+    return res.status(status).json({ error: message });
+  }
 });
 
 stockInsRouter.get("/by-invoice/:invoiceNo", async (req, res) => {
